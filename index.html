@@ -4,7 +4,7 @@
   <title>Boston Hospital Finder</title>
   <meta charset="UTF-8">
 
-  <!-- TODO: Ticket 1 — add Leaflet CSS link here -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
 
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -31,10 +31,15 @@
 
     #main { display: flex; height: calc(100vh - 110px); }
 
+    #map {
+      flex: 1;
+      height: 100%;
+    }
+
     /* TODO: Ticket 1 — add #map style here */
 
     #sidebar {
-      width: 100%; /* TODO: Ticket 1 — change to 320px once map is added */
+      width: 320px; /* TODO: Ticket 1 — change to 320px once map is added */
       background: white;
       border-left: 1px solid #ddd;
       display: flex; flex-direction: column;
@@ -65,6 +70,14 @@
     }
 
     /* TODO: Ticket 2 — add popup styles here if needed */
+    .popup-title { font-weight: bold; font-size: 14px; margin-bottom: 6px; }
+    .popup-addr  { font-size: 12px; color: #555; margin-bottom: 8px; }
+    .vuln-table  { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .vuln-table th { text-align: left; color: #888; font-weight: normal; padding: 2px 4px; }
+    .vuln-table td { text-align: right; font-weight: bold; padding: 2px 4px; }
+    .vuln-bar-wrap { background: #eee; border-radius: 4px; height: 6px; width: 80px; display:inline-block; vertical-align:middle; margin-left: 6px; }
+    .vuln-bar     { background: #003087; border-radius: 4px; height: 6px; }
+    .no-vuln      { font-size: 12px; color: #999; font-style: italic; }
   </style>
 </head>
 <body>
@@ -87,6 +100,8 @@
 
 <div id="main">
 
+  <div id="map"></div>
+
   <!-- TODO: Ticket 1 — add <div id="map"></div> here -->
 
   <div id="sidebar">
@@ -96,6 +111,7 @@
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <!-- TODO: Ticket 1 — add Leaflet JS script tag here -->
 
 <script>
@@ -105,13 +121,17 @@ const VULN_CSV     = "https://bostonopendata-boston.opendata.arcgis.com/api/down
 
 // ── State ──
 // TODO: Ticket 1 — add map and markersLayer variables here
+let map, markersLayer;
 let vulnByNeigh = {}; // stores vulnerability scores keyed by neighborhood name
 
 // ── TODO: Ticket 1 — add initMap() function here ──
-// Should:
-// 1. Create a Leaflet map centered on Boston [42.3601, -71.0589] zoom 12
-// 2. Add OpenStreetMap tile layer
-// 3. Create a markersLayer (L.layerGroup) and add to map
+function initMap() {
+  map = L.map("map").setView([42.3601, -71.0589], 12);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "© OpenStreetMap contributors"
+  }).addTo(map);
+  markersLayer = L.layerGroup().addTo(map);
+}
 
 // ── Robust CSV parser (handles quoted fields with embedded commas and newlines) ──
 function parseCSV(text) {
@@ -178,31 +198,105 @@ async function getZipCoords(zip) {
 }
 
 // ── TODO: Ticket 1 — add makeMarker(lat, lon) function here ──
-// Use L.circleMarker, radius 10, blue fill, white border
+function makeMarker(lat, lon) {
+  return L.circleMarker([lat, lon], {
+    radius: 10,
+    fillColor: "#003087",
+    color: "#ffffff",
+    weight: 2,
+    fillOpacity: 0.85
+  });
+}
+
+// ── Neighborhood name normalization for hospital → vulnerability join ──
+// Hospital NEIGH is uppercase and sometimes uses slashes for combined neighborhoods.
+// Vulnerability dataset uses title case single names. This map handles the mismatches.
+const NEIGH_MAP = {
+  "FENWAY/KENMORE":   "Fenway",
+  "ALLSTON/BRIGHTON": "Allston",
+  "CENTRAL":          null  // no matching neighborhood in vulnerability dataset
+};
+function normalizeNeigh(neigh) {
+  if (!neigh) return null;
+  const upper = neigh.toUpperCase().trim();
+  if (upper in NEIGH_MAP) return NEIGH_MAP[upper];
+  // Title-case the name and return as-is for direct matches
+  return neigh.trim().replace(/\w\S*/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+}
 
 // ── TODO: Ticket 2 — add loadVulnerability() function here ──
-// Should:
-// 1. Fetch VULN_CSV and parse it
-// 2. Group rows by neighborhood Name (multiple census tracts per neighborhood)
-// 3. For each neighborhood sum up the population and your chosen factors across all tracts
-// 4. Calculate each chosen factor as a percentage of total population:
-//    e.g. olderPct = (totalOlderAdult / totalPOP) * 100
-// 5. Store your chosen percentages in vulnByNeigh keyed by uppercase neighborhood name
-//
-// Available columns to choose from (pick at least 2):
-//   OlderAdult  — residents over 65
-//   TotChild    — children under 5
-//   Low_to_No   — low or no income households
-//   TotDis      — people with disabilities
-//   LEP         — limited English proficiency
-//
-// Think about: which factors are most relevant to hospital access?
+async function loadVulnerability() {
+  const text = await fetch(VULN_CSV).then(r => r.text());
+  const rows = parseCSV(text);
+
+  // Accumulate totals per neighborhood across census tract rows
+  const totals = {};
+  for (const row of rows) {
+    const name = (row["NAME"] || "").trim();
+    if (!name) continue;
+    if (!totals[name]) totals[name] = { pop: 0, older: 0, child: 0, lowinc: 0, dis: 0, lep: 0 };
+    totals[name].pop    += parseFloat(row["POP100_RE"]  || 0);
+    totals[name].older  += parseFloat(row["OLDERADULT"] || 0);
+    totals[name].child  += parseFloat(row["TOTCHILD"]   || 0);
+    totals[name].lowinc += parseFloat(row["LOW_TO_NO"]  || 0);
+    totals[name].dis    += parseFloat(row["TOTDIS"]     || 0);
+    totals[name].lep    += parseFloat(row["LEP"]        || 0);
+  }
+
+  // Convert totals to percentages and key by uppercase name for easy lookup
+  for (const [name, t] of Object.entries(totals)) {
+    if (!t.pop) continue;
+    const pct = v => +((v / t.pop) * 100).toFixed(1);
+    vulnByNeigh[name.toUpperCase()] = {
+      olderPct:  pct(t.older),
+      childPct:  pct(t.child),
+      lowincPct: pct(t.lowinc),
+      disPct:    pct(t.dis),
+      lepPct:    pct(t.lep)
+    };
+  }
+}
 
 // ── TODO: Ticket 2 — add makePopupHTML(hospital, vuln) function here ──
-// Should show:
-// - Hospital name and address
-// - A breakdown table: % elderly, % children under 5,
-//   % low income, % disabilities, % limited English
+function makePopupHTML(hospital, vuln) {
+  const name = hospital.NAME || "";
+  const addr = hospital.AD   || "";
+  const neigh = hospital.NEIGH || "";
+
+  if (!vuln) {
+    return `
+      <div class="popup-title">${name}</div>
+      <div class="popup-addr">📍 ${addr} &nbsp;·&nbsp; ${neigh}</div>
+      <div class="no-vuln">No vulnerability data for this neighborhood.</div>
+    `;
+  }
+
+  function row(label, pct) {
+    const bar = Math.min(pct, 100);
+    return `
+      <tr>
+        <th>${label}</th>
+        <td>${pct}%
+          <span class="vuln-bar-wrap"><span class="vuln-bar" style="width:${bar}%"></span></span>
+        </td>
+      </tr>`;
+  }
+
+  return `
+    <div class="popup-title">${name}</div>
+    <div class="popup-addr">📍 ${addr} &nbsp;·&nbsp; ${neigh}</div>
+    <table class="vuln-table">
+      <thead><tr><th colspan="2" style="padding-bottom:4px;color:#003087;font-weight:bold">Neighborhood Vulnerability</th></tr></thead>
+      <tbody>
+        ${row("Elderly (65+)",       vuln.olderPct)}
+        ${row("Children (under 5)", vuln.childPct)}
+        ${row("Low / No Income",    vuln.lowincPct)}
+        ${row("Disabilities",       vuln.disPct)}
+        ${row("Limited English",    vuln.lepPct)}
+      </tbody>
+    </table>
+  `;
+}
 
 // ── Render sidebar cards ──
 function renderSidebar(matches, markers) {
@@ -222,6 +316,8 @@ function renderSidebar(matches, markers) {
       document.querySelectorAll(".hospital-card").forEach(c => c.classList.remove("active"));
       card.classList.add("active");
       // TODO: Ticket 1 — pan map and open popup: markers[idx].openPopup(); map.panTo(...)
+      markers[idx].openPopup();
+      map.panTo([matches[idx].lat, matches[idx].lon]);
     };
     resultsDiv.appendChild(card);
   });
@@ -243,6 +339,7 @@ async function findHospitals() {
   loading.style.display = "block";
   resultsDiv.innerHTML  = "";
   // TODO: Ticket 1 — clear existing markers: markersLayer.clearLayers()
+  markersLayer.clearLayers();
 
   // Step 1: convert ZIP to coordinates
   const coords = await getZipCoords(zipInput);
@@ -252,9 +349,12 @@ async function findHospitals() {
     return;
   }
 
-  // Step 2: fetch hospital CSV
+  // Step 2: fetch hospital CSV + vulnerability data in parallel
   // TODO: Ticket 2 — also load vulnerability data here using Promise.all
-  const hospText  = await fetch(HOSPITAL_CSV).then(r => r.text());
+  const [hospText] = await Promise.all([
+    fetch(HOSPITAL_CSV).then(r => r.text()),
+    Object.keys(vulnByNeigh).length === 0 ? loadVulnerability() : Promise.resolve()
+  ]);
   const hospitals = parseCSV(hospText);
 
   // Step 3: extract coordinates from Location field and filter by radius
@@ -279,10 +379,23 @@ async function findHospitals() {
   sidebarHdr.textContent = `${matches.length} hospital${matches.length > 1 ? "s" : ""} within ${radius} miles of ${coords.city}, ${coords.state}`;
 
   // Step 4: add markers to map
-  // TODO: Ticket 1 — loop matches, call makeMarker() and add each to markersLayer
-  // TODO: Ticket 1 — fit map to markers: map.fitBounds(L.featureGroup(markers).getBounds().pad(0.2))
-  // TODO: Ticket 2 — bind popup to each marker: marker.bindPopup(makePopupHTML(h, vuln))
-  const markers = []; // TODO: Ticket 1 — fill this array with your markers
+  const markers = matches.map(h => {
+    // TODO: Ticket 1 — loop matches, call makeMarker() and add each to markersLayer
+    const marker = makeMarker(h.lat, h.lon);
+
+    // TODO: Ticket 2 — bind popup to each marker
+    const neighKey = normalizeNeigh(h.NEIGH);
+    const vuln = neighKey ? vulnByNeigh[neighKey.toUpperCase()] || null : null;
+    marker.bindPopup(makePopupHTML(h, vuln), { maxWidth: 260 });
+
+    marker.addTo(markersLayer);
+    return marker;
+  });
+
+  // TODO: Ticket 1 — fit map to markers
+  if (markers.length) {
+    map.fitBounds(L.featureGroup(markers).getBounds().pad(0.2));
+  }
 
   // Step 5: render sidebar
   renderSidebar(matches, markers);
@@ -295,6 +408,7 @@ document.getElementById("zip").addEventListener("keydown", e => {
 
 // ── Boot ──
 // TODO: Ticket 1 — call initMap() here
+initMap();
 </script>
 </body>
 </html>
